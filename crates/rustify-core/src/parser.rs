@@ -636,7 +636,7 @@ impl Parser {
         let mut cases = Vec::new();
         while self.at_kw("case") {
             self.advance();
-            let mut patterns = self.parse_pattern_alts()?;
+            let patterns = self.parse_pattern_alts()?;
             let guard = if self.at_kw("if") {
                 self.advance();
                 Some(self.parse_expr()?)
