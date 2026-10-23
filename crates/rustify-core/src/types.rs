@@ -26,6 +26,13 @@ pub enum Ty {
     Named(String),
     /// Callable of unknown shape.
     Callable,
+    /// A lambda / closure with a known shape (bound through a
+    /// `Callable[[P1, ..], R]` annotation).
+    Lambda {
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+        raises: bool,
+    },
     /// Not statically known.
     Unknown,
 }
@@ -79,7 +86,7 @@ impl Ty {
             Ty::Set(t) => format!("HashSet<{}>", t.rust()),
             Ty::Optional(t) => format!("Option<{}>", t.rust()),
             Ty::Named(n) => n.clone(),
-            Ty::Callable | Ty::Unknown => "PyValue".into(),
+            Ty::Lambda { .. } | Ty::Callable | Ty::Unknown => "PyValue".into(),
         }
     }
 
@@ -122,7 +129,7 @@ impl Ty {
             ),
             Ty::Optional(t) => format!("None::<{}>", t.rust()),
             Ty::Named(_) => "Default::default()".into(),
-            Ty::Callable | Ty::Unknown => "PyValue::None".into(),
+            Ty::Lambda { .. } | Ty::Callable | Ty::Unknown => "PyValue::None".into(),
         }
     }
 }
@@ -184,6 +191,12 @@ pub fn ty_from_annotation(e: &Expr) -> Ty {
             other => Ty::Named(other.to_string()),
         },
         Expr::Subscript { value, index } => {
+            // Callable[[P1, P2], R] gives a lambda its full shape.
+            if let Expr::Name(n) = &**value {
+                if n == "Callable" {
+                    return callable_shape_from_annotation(index);
+                }
+            }
             let base = ty_from_annotation(value);
             let args: Vec<Ty> = index
                 .iter()
@@ -238,6 +251,41 @@ pub fn ty_from_annotation(e: &Expr) -> Ty {
             _ => Ty::Unknown,
         },
         _ => Ty::Unknown,
+    }
+}
+
+/// `Callable[[P1, P2], R]` (also with a parenthesised `(P1, P2)`) becomes a
+/// fully typed lambda signature; anything else stays an unshaped callable.
+fn callable_shape_from_annotation(index: &[IndexItem]) -> Ty {
+    let mut params: Option<Vec<Ty>> = None;
+    let mut ret = Ty::Unknown;
+    let mut seen_params = false;
+    for it in index {
+        if let IndexItem::Single(e) = it {
+            if !seen_params {
+                match e {
+                    Expr::List(ps) => {
+                        params = Some(ps.iter().map(ty_from_annotation).collect());
+                        seen_params = true;
+                    }
+                    Expr::Tuple(ts) => {
+                        params = Some(ts.iter().map(ty_from_annotation).collect());
+                        seen_params = true;
+                    }
+                    _ => {}
+                }
+            } else {
+                ret = ty_from_annotation(e);
+            }
+        }
+    }
+    match params {
+        Some(ps) => Ty::Lambda {
+            params: ps,
+            ret: Box::new(ret),
+            raises: false,
+        },
+        None => Ty::Callable,
     }
 }
 
