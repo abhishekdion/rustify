@@ -827,6 +827,11 @@ impl Codegen {
         for s in body {
             match s {
                 Stmt::Assign { targets, value } => {
+                    // A lambda binds its own name; hoisting would misdeclare
+                    // it as a plain variable.
+                    if matches!(value, Expr::Lambda { .. }) {
+                        continue;
+                    }
                     let t = infer_expr(&self.env, value);
                     self.note_local(targets, &t, out);
                 }
@@ -835,6 +840,9 @@ impl Codegen {
                     annotation,
                     value,
                 } => {
+                    if matches!(value, Some(Expr::Lambda { .. })) {
+                        continue;
+                    }
                     // An explicit annotation wins over the value's type.
                     let ann = ty_from_annotation(annotation);
                     let t = if ann.is_unknown() {
@@ -972,6 +980,226 @@ impl Codegen {
         }
     }
 
+    /// Lower a lambda bound to a name (`f: Callable[[int], int] = lambda x: x`).
+    /// A module-level binding becomes a named function (lambdas cannot capture
+    /// anything at module level); a local binding becomes a closure that
+    /// captures surrounding locals naturally.
+    fn gen_lambda_binding(
+        &mut self,
+        target: &Expr,
+        params: &[Param],
+        body: &Expr,
+        expected: &Ty,
+    ) {
+        let name = match target {
+            Expr::Name(n) => n.clone(),
+            _ => {
+                self.diag(0, "unsupported: lambda bound to a non-name target");
+                return;
+            }
+        };
+        let (ptys, ret, mut raises) = match expected {
+            Ty::Lambda {
+                params,
+                ret,
+                raises,
+            } => (params.clone(), (**ret).clone(), *raises),
+            _ => {
+                self.diag(
+                    0,
+                    format!(
+                        "unsupported: lambda bound to `{}` without a `Callable[[..], ..]` annotation",
+                        name
+                    ),
+                );
+                return;
+            }
+        };
+        if ptys.len() != params.len() {
+            self.diag(
+                0,
+                format!(
+                    "unsupported: lambda `{}` has {} parameters, annotation has {}",
+                    name,
+                    params.len(),
+                    ptys.len()
+                ),
+            );
+            return;
+        }
+        if ptys.iter().any(|t| t.is_unknown()) {
+            self.diag(
+                0,
+                format!(
+                    "unsupported: lambda `{}` has untyped parameters ({})",
+                    name,
+                    ptys
+                        .iter()
+                        .map(|t| t.rust())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            return;
+        }
+
+        // A lambda body that can raise gets a `Result<_, PyErr>` closure.
+        raises = raises || self.lambda_may_raise(body);
+        let shape = Ty::Lambda {
+            params: ptys.clone(),
+            ret: Box::new(ret.clone()),
+            raises,
+        };
+
+        // Generate the body with the parameters in scope; free variables are
+        // resolved through the enclosing scopes (the closure captures them).
+        self.env.push_scope();
+        for (p, t) in params.iter().zip(ptys.iter()) {
+            self.env.set(&p.name, t.clone());
+        }
+        let (bcode, bty) = match self.gen_expr(body) {
+            Ok(x) => x,
+            Err(()) => {
+                self.env.pop_scope();
+                return;
+            }
+        };
+        self.env.pop_scope();
+        let bcode = self.coerce(&bcode, &bty, &ret);
+
+        let params_decl: Vec<String> = params
+            .iter()
+            .zip(ptys.iter())
+            .map(|(p, t)| format!("{}: {}", rust_ident(&p.name), t.rust()))
+            .collect();
+        let ret_decl = if raises {
+            format!("Result<{}, PyErr>", ret.rust())
+        } else {
+            ret.rust()
+        };
+        let final_body = if raises {
+            format!("Ok({})", bcode)
+        } else {
+            bcode
+        };
+
+        if self.module_level {
+            self.w(&format!(
+                "pub fn {}({}) -> {} {{",
+                rust_ident(&name),
+                params_decl.join(", "),
+                ret_decl
+            ));
+            self.indent += 1;
+            self.w(&final_body);
+            self.indent -= 1;
+            self.w("}");
+            self.w("");
+        } else {
+            self.w(&format!(
+                "let {} = |{}| -> {} {{",
+                rust_ident(&name),
+                params_decl.join(", "),
+                ret_decl
+            ));
+            self.indent += 1;
+            self.w(&final_body);
+            self.indent -= 1;
+            self.w("};");
+        }
+
+        self.env.set(&name, shape);
+        self.declared
+            .last_mut()
+            .unwrap()
+            .insert(rust_ident(&name));
+    }
+
+    /// True when a lambda body can raise: it calls a function or method whose
+    /// signature says it may raise.
+    fn lambda_may_raise(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Call { func, args } => {
+                if let Some(sig) = match func.as_ref() {
+                    Expr::Name(n) => self.env.funcs.get(n),
+                    _ => None,
+                } {
+                    if sig.raises {
+                        return true;
+                    }
+                }
+                if let Expr::Attribute { value, attr } = func.as_ref() {
+                    if let Expr::Name(base) = &**value {
+                        if let Some(info) = self.env.classes.get(base) {
+                            if let Some(sig) = info.methods.get(attr) {
+                                if sig.raises {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // A method call on a value of a known class may raise.
+                if let Expr::Attribute { value, attr } = func.as_ref() {
+                    let base = match value.as_ref() {
+                        Expr::Name(n) => self.env.lookup(n),
+                        _ => None,
+                    };
+                    if let Some(Ty::Named(cls)) = base {
+                        if let Some(info) = self.env.classes.get(&cls) {
+                            if let Some(sig) = info.methods.get(attr) {
+                                if sig.raises {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                args.iter().any(|a| match a {
+                    Arg::Pos(x) | Arg::Star(x) => self.lambda_may_raise(x),
+                    Arg::Kw(_, x) | Arg::DoubleStar(x) => self.lambda_may_raise(x),
+                })
+            }
+            Expr::BinOp { left, right, .. } => {
+                self.lambda_may_raise(left) || self.lambda_may_raise(right)
+            }
+            Expr::UnaryOp { operand, .. } => self.lambda_may_raise(operand),
+            Expr::BoolOp { values, .. } => values.iter().any(|v| self.lambda_may_raise(v)),
+            Expr::Compare {
+                left, comparators, ..
+            } => {
+                self.lambda_may_raise(left) || comparators.iter().any(|v| self.lambda_may_raise(v))
+            }
+            Expr::IfExp {
+                test, body, orelse,
+            } => {
+                self.lambda_may_raise(test)
+                    || self.lambda_may_raise(body)
+                    || self.lambda_may_raise(orelse)
+            }
+            Expr::Subscript { value, index } => {
+                self.lambda_may_raise(value)
+                    || index.iter().any(|i| match i {
+                        IndexItem::Single(x) => self.lambda_may_raise(x),
+                        IndexItem::Slice {
+                            lower,
+                            upper,
+                            step,
+                        } => {
+                            [lower, upper, step].iter().any(|o| {
+                                o.as_ref().map(|x| self.lambda_may_raise(x)).unwrap_or(false)
+                            })
+                        }
+                    })
+            }
+            Expr::Attribute { value, .. } => self.lambda_may_raise(value),
+            Expr::List(items) | Expr::Tuple(items) | Expr::Set(items) => {
+                items.iter().any(|i| self.lambda_may_raise(i))
+            }
+            _ => false,
+        }
+    }
+
     fn assign_to(&mut self, target: &Expr, code: &str, ty: &Ty) {
         match target {
             Expr::Name(n) => {
@@ -1032,6 +1260,12 @@ impl Codegen {
         value: &Option<Expr>,
     ) {
         let ty = ty_from_annotation(annotation);
+        // A lambda bound through a `Callable[[..], ..]` annotation gets its
+        // parameter and return types from the annotation.
+        if let Some(Expr::Lambda { params, body }) = value {
+            self.gen_lambda_binding(target, params, body, &ty);
+            return;
+        }
         if self.module_level {
             if let Expr::Name(n) = target {
                 let rid = rust_ident(n);
@@ -1678,7 +1912,10 @@ impl Codegen {
             }
             Expr::GeneratorExp { elt, generators } => self.gen_comprehension(elt, generators, false),
             Expr::Lambda { .. } => {
-                self.diag(0, "unsupported: lambda expression");
+                self.diag(
+                    0,
+                    "unsupported: lambda in expression position (bind it first: `f: Callable[[..], ..] = lambda ..`)",
+                );
                 Err(())
             }
             Expr::Starred(inner) => self.gen_expr(inner),
@@ -2201,6 +2438,47 @@ impl Codegen {
                     code.push('?');
                 }
                 return Ok((code, ret));
+            }
+            // Call of a lambda bound to a name (`f(1, 2)`).
+            if let Some(Ty::Lambda {
+                params: ptys,
+                ret,
+                raises,
+            }) = self.env.lookup(n)
+            {
+                if args.len() != ptys.len() {
+                    self.diag(
+                        0,
+                        format!(
+                            "wrong number of arguments to `{}`: {} given, {} expected",
+                            n,
+                            args.len(),
+                            ptys.len()
+                        ),
+                    );
+                    return Err(());
+                }
+                let mut parts: Vec<String> = Vec::new();
+                for (a, pty) in args.iter().zip(ptys.iter()) {
+                    match a {
+                        Arg::Pos(e) => {
+                            let (c, t) = self.gen_expr(e)?;
+                            parts.push(self.coerce_expr(e, &c, &t, pty));
+                        }
+                        _ => {
+                            self.diag(
+                                0,
+                                format!("unsupported: keyword/star argument to lambda `{}`", n),
+                            );
+                            return Err(());
+                        }
+                    }
+                }
+                let mut code = format!("{}({})", self.qualified_name(n), parts.join(", "));
+                if raises {
+                    code.push('?');
+                }
+                return Ok((code, (*ret).clone()));
             }
             // Class constructor.
             if let Some(info) = self.env.classes.get(n).cloned() {

@@ -697,6 +697,60 @@ mod tests {
     }
 
     #[test]
+    fn module_level_lambda_becomes_a_named_function() {
+        let (code, diags) = transpile(
+            "from typing import Callable\n\nf: Callable[[int, int], int] = lambda a, b: a + b\n\ndef use() -> int:\n    return f(1, 2)\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("pub fn f(a: i64, b: i64) -> i64 {"), "{}", code);
+        assert!(code.contains("f(1, 2)"), "{}", code);
+    }
+
+    #[test]
+    fn local_lambda_becomes_a_capturing_closure() {
+        let (code, diags) = transpile(
+            "from typing import Callable\n\ndef make(n: int) -> int:\n    add: Callable[[int], int] = lambda x: x + n\n    return add(3)\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("|x: i64|"), "{}", code);
+        assert!(code.contains("add(3)"), "{}", code);
+    }
+
+    #[test]
+    fn raising_lambda_becomes_a_result_closure() {
+        let (code, diags) = transpile(
+            "from typing import Callable\n\ndef check(x: int) -> int:\n    if x < 0:\n        raise ValueError(\"bad\")\n    return x\n\nf: Callable[[int], int] = lambda x: check(x)\n\ndef use(x: int) -> int:\n    return f(x)\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("pub fn f(x: i64) -> Result<i64, PyErr> {"), "{}", code);
+        assert!(code.contains("f(x)?"), "{}", code);
+    }
+
+    #[test]
+    fn untyped_lambda_is_reported_not_mistranslated() {
+        let (_, diags) = transpile("f = lambda a: a\n");
+        assert!(
+            diags.iter().any(|d| d.message.contains("lambda")),
+            "expected a lambda diagnostic, got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn lambda_default_factory_on_dataclass_fields_still_works() {
+        let (code, diags) = transpile(
+            "from dataclasses import dataclass, field\n\n@dataclass\nclass P:\n    cells: list[int] = field(default_factory=lambda: [])\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("pub cells: Vec<i64>,"), "{}", code);
+        assert!(
+            code.contains("cells: Default::default(),"),
+            "expected an empty-list field default, got: {}",
+            code
+        );
+    }
+
+    #[test]
     fn match_as_a_variable_name_is_still_parsed() {
         let (code, diags) = transpile(
             "def f(x: int) -> int:\n    match = x + 1\n    return match\n",

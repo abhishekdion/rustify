@@ -136,7 +136,33 @@ pub fn infer_expr(env: &Env, e: &Expr) -> Ty {
             Box::new(infer_expr(env, value)),
         ),
         Expr::GeneratorExp { elt, .. } => infer_expr(env, elt),
-        Expr::Lambda { .. } => Ty::Callable,
+        Expr::Lambda { params, body } => {
+            // Infer the body with the parameters in scope. Python lambdas
+            // cannot have annotated parameters, so parameter types come from
+            // the binding annotation (`Callable[[..], ..]`) at codegen time.
+            let mut scopes = env.scopes.clone();
+            scopes.push(
+                params
+                    .iter()
+                    .map(|p| (p.name.clone(), Ty::Unknown))
+                    .collect(),
+            );
+            let scoped = Env {
+                scopes,
+                funcs: env.funcs.clone(),
+                classes: env.classes.clone(),
+                diagnostics: Vec::new(),
+                module_vars: env.module_vars.clone(),
+                func_bodies: env.func_bodies.clone(),
+                module_scopes: env.module_scopes.clone(),
+            };
+            let ret = infer_expr(&scoped, body);
+            Ty::Lambda {
+                params: params.iter().map(|_| Ty::Unknown).collect(),
+                ret: Box::new(ret),
+                raises: false,
+            }
+        }
         Expr::Starred(inner) => infer_expr(env, inner),
     }
 }

@@ -52,6 +52,21 @@ Non-exhaustive Python matches get a fallback arm so the generated Rust still
 compiles with Python's fall-through semantics, and `match` used as a plain
 variable name keeps parsing as an identifier.
 
+#### New in this slice: lambdas
+
+A lambda bound through a `Callable[[..], ..]` annotation gets its full
+parameter/return shape from the annotation:
+
+- Module level: `f: Callable[[int, int], int] = lambda a, b: a + b` becomes a
+  named `pub fn f(a: i64, b: i64) -> i64 { .. }`.
+- Function level: the same binding becomes a Rust closure
+  (`let add = |x: i64| (x) + (n);`) that captures surrounding locals naturally.
+- A lambda body that can raise becomes `Result<_, PyErr>`, and call sites get
+  the `?` propagation.
+- `field(default_factory=lambda: [])` keeps working.
+
+Untyped lambdas are reported as diagnostics, not mistranslated.
+
 ### Semantic lowering
 
 - **Function scope.** Python locals are visible after the block that assigns
@@ -96,7 +111,8 @@ Methods on `str`, `bytes`, `list`, `dict` — the common ones.
 These are reported as diagnostics at transpile time, not silently mistranslated:
 
 - `async`/`await`, generators that are consumed lazily.
-- Lambdas (except as `field(default_factory=...)`).
+- Lambdas used in expression position, or bound without a type annotation
+  (bind via `f: Callable[[..], ..] = lambda ...`).
 - Star-args and double-star-args at call sites.
 - Python's arbitrary-precision integers map to `i64`; values beyond that range
   are rejected by the lexer.
