@@ -6,6 +6,27 @@
 use crate::ast::*;
 use crate::lexer::{Lexer, Tok};
 
+/// Flatten a parsed pattern expression into its OR-alternatives. A top-level
+/// BitOr binary operator is always pattern alternation (`case 2 | 3:`).
+fn pattern_from_expr(e: Expr) -> Vec<Pattern> {
+    match e {
+        Expr::BinOp {
+            op: BinOp::BitOr,
+            left,
+            right,
+        } => {
+            let mut out = pattern_from_expr(*left);
+            out.extend(pattern_from_expr(*right));
+            out
+        }
+        Expr::Name(n) => match n.as_str() {
+            "None" | "True" | "False" => vec![Pattern::Value(Expr::Name(n))],
+            _ => vec![Pattern::Capture(n)],
+        },
+        other => vec![Pattern::Value(other)],
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub line: usize,
@@ -205,6 +226,15 @@ impl Parser {
                 "def" => Ok(vec![self.parse_funcdef(Vec::new())?]),
                 "class" => Ok(vec![self.parse_classdef(Vec::new())?]),
                 "async" => self.err("async def is not supported"),
+                "match" => {
+                    // `match` is a soft keyword: only a match statement when
+                    // not followed by an operator that makes it an expression.
+                    if matches!(self.peek_at(1), Tok::Op(o) if matches!(*o, "=" | "." | "(" | "[" | "{" | "," | "+" | "-" | "*" | "/")) {
+                        self.parse_simple_stmt_line()
+                    } else {
+                        Ok(vec![self.parse_match()?])
+                    }
+                }
                 _ => self.parse_simple_stmt_line(),
             },
             _ => self.parse_simple_stmt_line(),
@@ -588,6 +618,83 @@ impl Parser {
         self.expect_op(":")?;
         let body = self.parse_block()?;
         Ok(Stmt::With { items, body })
+    }
+
+    /// Python 3.10+ structural pattern matching.
+    fn parse_match(&mut self) -> Result<Stmt, ParseError> {
+        self.advance(); // `match`
+        let subject = self.parse_expr()?;
+        self.expect_op(":")?;
+        // Enter the indented case suite.
+        if matches!(self.peek(), Tok::Newline) {
+            self.advance();
+        }
+        if !matches!(self.peek(), Tok::Indent) {
+            return self.err("match expects an indented case block");
+        }
+        self.advance();
+        let mut cases = Vec::new();
+        while self.at_kw("case") {
+            self.advance();
+            let mut patterns = self.parse_pattern_alts()?;
+            let guard = if self.at_kw("if") {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect_op(":")?;
+            let body = self.parse_block()?;
+            cases.push(MatchCase {
+                patterns,
+                guard,
+                body,
+            });
+        }
+        // Leave the case suite.
+        if matches!(self.peek(), Tok::Dedent) {
+            self.advance();
+        } else {
+            return self.err("expected a case under match");
+        }
+        if cases.is_empty() {
+            return self.err("match must have at least one case");
+        }
+        Ok(Stmt::Match { subject, cases })
+    }
+
+    /// One pattern alternative list. `2 | 3` flattens into two alternatives;
+    /// a top-level BitOr binary operator is always alternation in a pattern.
+    fn parse_pattern_alts(&mut self) -> Result<Vec<Pattern>, ParseError> {
+        // Tuple pattern: `(a, b)` (possibly with a trailing comma, which also
+        // makes a single-element pattern a tuple).
+        if self.at_op("(") {
+            self.advance();
+            let mut items = Vec::new();
+            loop {
+                let alts = self.parse_pattern_alts()?;
+                if alts.len() != 1 {
+                    return self.err("unsupported pattern: alternatives inside tuples");
+                }
+                items.push(alts.into_iter().next().unwrap());
+                if !self.eat_op(",") {
+                    break;
+                }
+                if self.at_op(")") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            return Ok(vec![Pattern::Tuple(items)]);
+        }
+        if matches!(self.peek(), Tok::Name(n) if n == "_") {
+            self.advance();
+            return Ok(vec![Pattern::Wildcard]);
+        }
+        // `parse_or` stops before the ternary `if`, which the guard below
+        // consumes itself.
+        let e = self.parse_or()?;
+        Ok(pattern_from_expr(e))
     }
 
     fn parse_funcdef(&mut self, decorators: Vec<Expr>) -> Result<Stmt, ParseError> {
