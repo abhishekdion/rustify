@@ -1,0 +1,26 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Generated project output
+rust_out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Node (desktop app)
+node_modules/
+dist-electron/
+.tauri/

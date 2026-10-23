@@ -1,0 +1,14 @@
+[package]
+name = "rustify-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for the Rustify Python -> Rust transpiler"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rustify"
+path = "src/main.rs"
+
+[dependencies]
+rustify-core = { path = "../rustify-core" }
