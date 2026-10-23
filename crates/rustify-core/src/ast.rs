@@ -122,6 +122,28 @@ pub struct Handler {
     pub body: Vec<Stmt>,
 }
 
+/// One `case` arm of a Python `match` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCase {
+    /// OR-alternatives: `case A | B:` has two entries.
+    pub patterns: Vec<Pattern>,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+/// A structural pattern (literal, capture, wildcard, tuple, dotted constant).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// A constant that the subject is compared against: literal or dotted.
+    Value(Expr),
+    /// A bare lowercase name that binds the subject (`case x:`).
+    Capture(String),
+    /// `_`
+    Wildcard,
+    /// `(a, b)` — positional tuple pattern.
+    Tuple(Vec<Pattern>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Import {
@@ -201,6 +223,10 @@ pub enum Stmt {
         msg: Option<Expr>,
     },
     Delete(Vec<Expr>),
+    Match {
+        subject: Expr,
+        cases: Vec<MatchCase>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

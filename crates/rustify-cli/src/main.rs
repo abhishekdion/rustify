@@ -644,4 +644,74 @@ mod tests {
         assert_eq!(resolve_relative("a.b.c", 2, "models"), "a.b.models");
         assert_eq!(resolve_relative("a.b.c", 3, "base"), "a.base");
     }
+
+    #[test]
+    fn match_statement_becomes_a_rust_match() {
+        let (code, diags) = transpile(
+            "def f(x: int) -> str:\n    match x:\n        case 1:\n            return \"one\"\n        case 2 | 3:\n            return \"few\"\n        case _:\n            return \"many\"\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("match "), "{}", code);
+        assert!(code.contains("1 => {"), "{}", code);
+        assert!(code.contains("2 | 3 => {"), "{}", code);
+        assert!(code.contains("_ => {"), "{}", code);
+    }
+
+    #[test]
+    fn non_exhaustive_match_gets_a_fallback_arm() {
+        let (code, diags) = transpile(
+            "def f(x: int) -> str:\n    match x:\n        case 1:\n            return \"one\"\n    return \"done\"\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("1 => {"), "{}", code);
+        assert!(code.contains("_ => {}"), "{}", code);
+        assert!(code.contains("\"done\""), "{}", code);
+    }
+
+    #[test]
+    fn match_guards_use_captured_values() {
+        let (code, diags) = transpile(
+            "def f(x: int) -> str:\n    match x:\n        case n if n > 10:\n            return \"big\"\n        case _:\n            return \"small\"\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("if ("), "{}", code);
+        assert!(code.contains("\"big\""), "{}", code);
+    }
+
+    #[test]
+    fn match_tuple_patterns_unpack() {
+        let (code, diags) = transpile(
+            "def f(p: tuple[int, int]) -> int:\n    match p:\n        case (0, y):\n            return y\n        case _:\n            return 0\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("(0, y)"), "{}", code);
+    }
+
+    #[test]
+    fn match_dotted_constants_are_pattern_usable() {
+        let (code, diags) = transpile(
+            "class Kind:\n    A = 1\n    B = 2\n\ndef f(x: int) -> str:\n    match x:\n        case Kind.A:\n            return \"a\"\n        case _:\n            return \"b\"\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("Kind::A => {"), "{}", code);
+    }
+
+    #[test]
+    fn match_as_a_variable_name_is_still_parsed() {
+        let (code, diags) = transpile(
+            "def f(x: int) -> int:\n    match = x + 1\n    return match\n",
+        );
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert!(code.contains("match_"), "{}", code);
+        assert!(code.contains("(x) + (1)"), "{}", code);
+    }
+
+    #[test]
+    fn unsupported_patterns_are_reported_not_mistranslated() {
+        let (_, diags) = transpile(
+            "def f(x: int) -> int:\n    match x:\n        case [1, 2]:\n            return 1\n        case _:\n            return 0\n",
+        );
+    assert!(diags.iter().any(|d| d.message.contains("unsupported")),
+            "expected a diagnostic, got {:?}", diags);
+    }
 }
