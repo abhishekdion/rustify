@@ -184,6 +184,7 @@ impl Codegen {
                     }
                 }
             }
+            Stmt::Match { subject, cases } => self.gen_match(subject, cases),
         }
     }
 
@@ -508,6 +509,174 @@ impl Codegen {
         self.w("}");
     }
 
+    /// Python 3.10 `match` statement. Lowered to a native Rust `match` with
+    /// the same structure: literal / dotted-constant patterns, captures,
+    /// or-alternatives, guards, tuples, and a fallback arm that mirrors
+    /// Python's fall-through semantics.
+    fn gen_match(&mut self, subject: &Expr, cases: &[MatchCase]) {
+        // Infer the subject's type so capture bindings keep it.
+        let sty0 = infer_expr(&self.env, subject);
+        let (scode, sty) = match self.gen_expr(subject) {
+            Ok(x) => x,
+            Err(()) => {
+                self.diag(0, "unsupported: match subject expression");
+                return;
+            }
+        };
+        // Prefer the inferred (pre-codegen) type, falling back to codegen's.
+        let sty = if sty0.is_unknown() { sty } else { sty0 };
+        let scrut = self.temp();
+        self.w(&format!("let {} = ({});", scrut, scode));
+        self.w(&format!("match {} {{", scrut));
+        self.indent += 1;
+
+        let mut catch_all = false;
+        let mut aborted = false;
+        for case in cases {
+            self.env.push_scope();
+
+            // Collect capture bindings and build the Rust pattern.
+            let mut pat_parts: Vec<String> = Vec::new();
+            for p in &case.patterns {
+                match self.rust_pattern(p, &sty) {
+                    Ok(Some(pp)) => pat_parts.push(pp),
+                    Ok(None) => {
+                        aborted = true;
+                    }
+                    Err(e) => {
+                        self.diag(0, e);
+                        aborted = true;
+                    }
+                }
+            }
+            if aborted {
+                self.env.pop_scope();
+                self.w("/* match not transpiled */ _ => {}");
+                self.indent -= 1;
+                return;
+            }
+            let pat = if pat_parts.len() == 1 {
+                pat_parts.into_iter().next().unwrap()
+            } else {
+                pat_parts.join(" | ")
+            };
+
+            let mut arm = pat;
+            if let Some(g) = &case.guard {
+                let ty = match self.gen_expr(g) {
+                    Ok((c, _)) => c,
+                    Err(()) => {
+                        self.diag(0, "unsupported: match guard expression");
+                        self.env.pop_scope();
+                        self.w("/* match not transpiled */ _ => {}");
+                        self.indent -= 1;
+                        return;
+                    }
+                };
+                arm = format!("{} if ({})", arm, ty);
+            }
+            self.w(&format!("{} => {{", arm));
+            self.indent += 1;
+            let r = self.gen_block_result(&case.body, &self.cur_ret.clone(), self.cur_raises);
+            self.indent -= 1;
+            if r.is_err() {
+                self.w("}");
+                self.env.pop_scope();
+                return;
+            }
+            self.w("}");
+
+            // A wildcard or an unguarded capture catches everything.
+            if case.guard.is_none()
+                && case.patterns.iter().any(|p| match p {
+                    Pattern::Wildcard => true,
+                    Pattern::Capture(_) => true,
+                    _ => false,
+                })
+            {
+                catch_all = true;
+            }
+            self.env.pop_scope();
+        }
+        self.indent -= 1;
+
+        // Python never requires exhaustiveness. Without a catch-all append one
+        // so the generated Rust still compiles and control flow falls through,
+        // exactly as an unmatched `match` would in Python.
+        if !catch_all {
+            self.w("        _ => {}");
+        }
+        self.w("}");
+    }
+
+    /// Render one pattern alternative as Rust. Returns `Ok(None)` when the
+    /// pattern combination is not supported.
+    fn rust_pattern(
+        &mut self,
+        p: &Pattern,
+        subject_ty: &Ty,
+    ) -> Result<Option<String>, String> {
+        match p {
+            Pattern::Wildcard => Ok(Some("_".into())),
+            Pattern::Capture(n) => {
+                // Rust binds the capture natively; record its type in scope so
+                // the case body sees it.
+                self.env.set(n, subject_ty.clone());
+                Ok(Some(rust_ident(n)))
+            }
+            Pattern::Tuple(items) => {
+                if let Ty::Tuple(elem_tys) = subject_ty {
+                    if items.len() == elem_tys.len() {
+                        let mut parts = Vec::new();
+                        for (item, ety) in items.iter().zip(elem_tys) {
+                            match self.rust_pattern(item, ety)? {
+                                Some(pp) => parts.push(pp),
+                                None => return Ok(None),
+                            }
+                        }
+                        return Ok(Some(format!("({})", parts.join(", "))));
+                    }
+                }
+                Err("unsupported: tuple pattern without a matching tuple type".into())
+            }
+            Pattern::Value(e) => self.pattern_value(e),
+        }
+    }
+
+    /// Render a constant pattern value: literal or dotted constant.
+    fn pattern_value(&mut self, e: &Expr) -> Result<Option<String>, String> {
+        match e {
+            Expr::Num(NumVal::Int(v)) => Ok(Some(format!("{}", v))),
+            Expr::Num(NumVal::Float(v)) => Ok(Some(format!("{:?}", v))),
+            Expr::Name(n) => match n.as_str() {
+                "None" => Ok(Some("None".into())),
+                "True" => Ok(Some("true".into())),
+                "False" => Ok(Some("false".into())),
+                _ => Err(format!(
+                    "unsupported: pattern `{}` (bare names are captures; constants must be dotted)",
+                    n
+                )),
+            },
+            Expr::Str { value, kind } => Ok(Some(match kind {
+                StrKind::Str => format!("{:?}", value),
+                StrKind::Bytes => format!("*b{:?}", value),
+            })),
+            // `Cls.CONST` — enums are lowered to structs with associated
+            // constants, so the pattern is `Cls::CONST`.
+            Expr::Attribute { value, attr } => {
+                if let Expr::Name(base) = &**value {
+                    Ok(Some(format!("{}::{}", rust_ident(base), rust_ident(attr))))
+                } else {
+                    Err("unsupported: nested dotted pattern".into())
+                }
+            }
+            other => Err(format!(
+                "unsupported: pattern is not a literal, constant, or tuple ({})",
+                Self::describe_expr(other)
+            )),
+        }
+    }
+
     /// Emit the `else` / `else if` continuation of an `if` statement.
     fn gen_else_chain(&mut self, orelse: &[Stmt]) {
         if orelse.is_empty() {
@@ -708,6 +877,11 @@ impl Codegen {
                     self.prescan_locals(finalbody, out);
                 }
                 Stmt::With { body, .. } => self.prescan_locals(body, out),
+                Stmt::Match { cases, .. } => {
+                    for c in cases {
+                        self.prescan_locals(&c.body, out);
+                    }
+                }
                 _ => {}
             }
         }
