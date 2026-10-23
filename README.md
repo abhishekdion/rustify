@@ -43,6 +43,15 @@ py2rs scan  --root <project-dir>
 | `class C(B)` | `struct C` with `B`'s fields flattened in |
 | `raise` | `Result<T, PyErr>` on the function that raises |
 
+#### New in this slice: Python 3.10 `match` statements
+
+`match` lowers to a native Rust `match`: literal and dotted-constant patterns
+(`case Kind.A:`), captures (`case n:`), or-alternatives (`case 2 | 3:`),
+guards (`case n if n > 10:`), and tuple unpacking (`case (a, b):`).
+Non-exhaustive Python matches get a fallback arm so the generated Rust still
+compiles with Python's fall-through semantics, and `match` used as a plain
+variable name keeps parsing as an identifier.
+
 ### Semantic lowering
 
 - **Function scope.** Python locals are visible after the block that assigns
@@ -86,7 +95,7 @@ Methods on `str`, `bytes`, `list`, `dict` — the common ones.
 
 These are reported as diagnostics at transpile time, not silently mistranslated:
 
-- `async`/`await`, generators that are consumed lazily, `match` statements.
+- `async`/`await`, generators that are consumed lazily.
 - Lambdas (except as `field(default_factory=...)`).
 - Star-args and double-star-args at call sites.
 - Python's arbitrary-precision integers map to `i64`; values beyond that range
